@@ -24,6 +24,7 @@ jobs:
       SIGNING_FINGERPRINT: ff721d2f1961d710e64ee4a388a8055b25fe28a3929c2888e74afad384fd7d43
       SOURCE_INFO: src/zh/copymanga/build/keiyoushi-source-info.json
       RELEASE_OUTPUT: src/zh/copymanga/build/outputs/apk/release
+      JAR_OUTPUT: src/zh/copymanga/build/outputs/jar/release
 
     steps:
       - name: Check out public source
@@ -48,7 +49,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Lint and build release APK from source
+      - name: Lint and build release APK and JVM JAR from source
         id: build
         shell: bash
         run: |
@@ -77,6 +78,9 @@ jobs:
               raise SystemExit("Gradle APK metadata does not match the source")
           if apk["outputFile"] != f"tachiyomi-zh.copymanga-v{version}.apk":
               raise SystemExit("Unexpected release APK filename")
+          jar_name = Path(apk["outputFile"]).with_suffix(".jar").name
+          if not (Path(os.environ["JAR_OUTPUT"]) / jar_name).is_file():
+              raise SystemExit("Gradle did not produce the matching JVM JAR")
           previous = Path("index.pb")
           if previous.is_file():
               index = index_pb2.Index.FromString(gzip.decompress(previous.read_bytes()))
@@ -86,14 +90,16 @@ jobs:
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as env:
               print(f"tag=v{version}", file=env)
               print(f"apk_name={apk['outputFile']}", file=env)
+              print(f"jar_name={jar_name}", file=env)
           PY
 
-      - name: Sign APK and verify certificate continuity
+      - name: Sign APK and JVM JAR and verify APK certificate continuity
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
           APK_NAME: ${{ steps.build.outputs.apk_name }}
+          JAR_NAME: ${{ steps.build.outputs.jar_name }}
         run: |
           test -n "$SIGNING_KEY"
           test -n "$SIGNING_PASSWORD"
@@ -105,56 +111,85 @@ jobs:
           "$signer" sign --ks "$key" --ks-key-alias copymanga-release \
             --ks-pass env:SIGNING_PASSWORD --key-pass env:SIGNING_PASSWORD \
             --in "$RELEASE_OUTPUT/$APK_NAME" --out "release-assets/$APK_NAME"
+          "$signer" sign --ks "$key" --ks-key-alias copymanga-release \
+            --ks-pass env:SIGNING_PASSWORD --key-pass env:SIGNING_PASSWORD \
+            --min-sdk-version 26 --v1-signer-name CERT --v1-signing-enabled true \
+            --v2-signing-enabled false --v3-signing-enabled false --v4-signing-enabled false \
+            --in "$JAR_OUTPUT/$JAR_NAME" --out "release-assets/$JAR_NAME"
           fingerprint=$("$signer" verify --print-certs "release-assets/$APK_NAME" |
             awk '/certificate SHA-256 digest:/{print tolower($NF)}')
           test "$fingerprint" = "$SIGNING_FINGERPRINT"
 
-      - name: Attest the signed APK
+      - name: Verify the signed pair and link the JVM extension
+        shell: bash
+        env:
+          APK_NAME: ${{ steps.build.outputs.apk_name }}
+          JAR_NAME: ${{ steps.build.outputs.jar_name }}
+        run: |
+          python scripts/verify-release-artifact.py --source-info "$SOURCE_INFO" \
+            --apk "release-assets/$APK_NAME" --jar "release-assets/$JAR_NAME" \
+            --aapt "$ANDROID_HOME/build-tools/37.0.0/aapt"
+          ./gradlew --no-configuration-cache :src:zh:copymanga:verifyReleaseExtensionJarJvm \
+            -PextensionJvmVerifyJar="release-assets/$JAR_NAME" -PextensionJvmExpectedSigner="$SIGNING_FINGERPRINT"
+
+      - name: Attest the signed APK and JVM JAR
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: release-assets/${{ steps.build.outputs.apk_name }}
+          subject-path: |
+            release-assets/${{ steps.build.outputs.apk_name }}
+            release-assets/${{ steps.build.outputs.jar_name }}
 
-      - name: Publish the attested APK and update Mihon
+      - name: Publish the attested assets and update the extension index
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.build.outputs.tag }}
           APK_NAME: ${{ steps.build.outputs.apk_name }}
+          JAR_NAME: ${{ steps.build.outputs.jar_name }}
         run: |
           test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
           apk="release-assets/$APK_NAME"
-          python scripts/build-repo-index.py --source-info "$SOURCE_INFO" --apk "$apk" \
+          jar="release-assets/$JAR_NAME"
+          python scripts/build-repo-index.py --source-info "$SOURCE_INFO" --apk "$apk" --jar "$jar" \
             --output-dir . --repository "$GH_REPO" --release-tag "$TAG" --signing-key "$SIGNING_FINGERPRINT"
-          python scripts/verify-repo-index.py --index-dir . --source-info "$SOURCE_INFO" --apk "$apk" \
+          python scripts/verify-repo-index.py --index-dir . --source-info "$SOURCE_INFO" --apk "$apk" --jar "$jar" \
             --repository "$GH_REPO" --release-tag "$TAG" --signing-key "$SIGNING_FINGERPRINT"
 
           if release=$(gh release view "$TAG" --json isDraft,targetCommitish,assets,url); then
             test "$(jq -r .targetCommitish <<< "$release")" = "$GITHUB_SHA"
             draft=$(jq -r .isDraft <<< "$release")
-            if ! jq -e --arg name "$APK_NAME" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
-              test "$draft" = true
-              gh release upload "$TAG" "$apk"
-            fi
+            for artifact in "$apk" "$jar"; do
+              if ! jq -e --arg name "$(basename "$artifact")" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+                test "$draft" = true
+                gh release upload "$TAG" "$artifact"
+              fi
+            done
           else
             notes="$RUNNER_TEMP/release-notes.md"
             {
               printf '由公開原始碼透過 [GitHub Actions](%s/%s/actions/runs/%s) 建構、簽署並發布。\n\n' \
                 "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-              printf '可使用 GitHub CLI 驗證 APK 的建構來源。\n\n'
-              printf '\x60\x60\x60sh\ngh attestation verify %s -R %s\n\x60\x60\x60\n' "$APK_NAME" "$GH_REPO"
+              printf '可使用 GitHub CLI 驗證 APK 和 JVM JAR 的建構來源。\n\n'
+              printf '\x60\x60\x60sh\ngh attestation verify %s -R %s\ngh attestation verify %s -R %s\n\x60\x60\x60\n' \
+                "$APK_NAME" "$GH_REPO" "$JAR_NAME" "$GH_REPO"
             } > "$notes"
-            gh release create "$TAG" "$apk" --target "$GITHUB_SHA" --draft \
+            gh release create "$TAG" "$apk" "$jar" --target "$GITHUB_SHA" --draft \
               --title "CopyManga $TAG" --notes-file "$notes"
             draft=true
           fi
 
           published=$(mktemp -d)
           trap 'rm -rf "$published"' EXIT
-          gh release download "$TAG" --pattern "$APK_NAME" --dir "$published"
-          gh attestation verify "$published/$APK_NAME" -R "$GH_REPO" \
-            --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
-            --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          gh release view "$TAG" --json assets |
+            jq -e --arg apk "$APK_NAME" --arg jar "$JAR_NAME" \
+              '([.assets[].name] | sort) == ([$apk, $jar] | sort)' >/dev/null
+          gh release download "$TAG" --pattern "$APK_NAME" --pattern "$JAR_NAME" --dir "$published"
+          for asset in "$APK_NAME" "$JAR_NAME"; do
+            gh attestation verify "$published/$asset" -R "$GH_REPO" \
+              --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
+              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
           test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
           if [[ "$draft" == true ]]; then
             gh release edit "$TAG" --draft=false

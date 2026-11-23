@@ -29,12 +29,14 @@ import kotlinx.serialization.json.Json
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.artifacts.type.ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE
+import org.gradle.api.tasks.JavaExec
 import org.gradle.kotlin.dsl.configure
 import org.gradle.kotlin.dsl.create
 import org.gradle.kotlin.dsl.dependencies
 import org.gradle.kotlin.dsl.findByType
 import org.gradle.kotlin.dsl.register
 import org.gradle.kotlin.dsl.withType
+import org.gradle.process.CommandLineArgumentProvider
 
 @Suppress("UNUSED")
 class ExtensionPlugin : Plugin<Project> {
@@ -239,6 +241,21 @@ class ExtensionPlugin : Plugin<Project> {
 
                     tasks.matching { it.name == "assemble$variantName" }
                         .configureEach { dependsOn(signTask) }
+
+                    val externalJar = providers.gradleProperty("extensionJvmVerifyJar")
+                    val jarToVerify = externalJar.map { rootProject.file(it) }
+                        .orElse(signTask.flatMap { it.outputJar }.map { it.asFile })
+                    val expectedSigner = providers.gradleProperty("extensionJvmExpectedSigner").orElse("")
+                    tasks.register<JavaExec>("verify${variantName}ExtensionJarJvm") {
+                        if (!externalJar.isPresent) dependsOn(signTask)
+                        inputs.file(jarToVerify)
+                        classpath(externalLibs, bootClasspath)
+                        jvmArgs("-Xverify:all")
+                        mainClass.set(rootProject.file("scripts/VerifyExtensionJvm.java").absolutePath)
+                        argumentProviders.add(CommandLineArgumentProvider {
+                            listOf(jarToVerify.get().absolutePath, expectedSigner.get())
+                        })
+                    }
                 }
             }
         }

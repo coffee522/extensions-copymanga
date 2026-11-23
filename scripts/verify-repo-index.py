@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-dir", type=Path, required=True)
     parser.add_argument("--source-info", type=Path, required=True)
     parser.add_argument("--apk", type=Path, required=True)
+    parser.add_argument("--jar", type=Path, required=True)
     parser.add_argument("--repository", required=True, help="OWNER/REPOSITORY")
     parser.add_argument("--release-tag", required=True)
     parser.add_argument("--signing-key", required=True)
@@ -40,6 +41,11 @@ def require(condition: bool, message: str) -> None:
 def main() -> int:
     args = parse_args()
     info = json.loads(args.source_info.read_text(encoding="utf-8"))
+    require(args.release_tag == f"v{info['versionName']}", "release tag does not match source-info")
+    base_name = f"tachiyomi-{info['module']}-{args.release_tag}"
+    for artifact, suffix in ((args.apk, ".apk"), (args.jar, ".jar")):
+        require(artifact.is_file(), f"missing release artifact: {artifact}")
+        require(artifact.name == base_name + suffix, f"invalid release artifact name: {artifact}")
     sources = info.get("sources") or []
     require(len(sources) == 1, "source-info must contain exactly one source")
     source = sources[0]
@@ -74,7 +80,10 @@ def main() -> int:
         extension.resources.apkUrl == f"{release_base}/{args.apk.name}",
         "index APK URL does not match the release asset",
     )
-    require(not extension.resources.jarUrl, "the Mihon index must not list a JAR")
+    require(
+        extension.resources.jarUrl == f"{release_base}/{args.jar.name}",
+        "index JAR URL does not match the release asset",
+    )
     require(index.signingKey == args.signing_key, "index signing fingerprint does not match")
 
     repo = json.loads((args.index_dir / "repo.json").read_text(encoding="utf-8"))

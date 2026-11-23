@@ -20,7 +20,7 @@ tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") }.con
 keiyoushi {
     name = "CopyManga"
     versionCode.set(
-        providers.gradleProperty("extensionReleaseVersionCode").map { it.toInt() }.orElse(12),
+        providers.gradleProperty("extensionReleaseVersionCode").map { it.toInt() }.orElse(13),
     )
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"

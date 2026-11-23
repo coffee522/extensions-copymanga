@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-info", type=Path, required=True)
     parser.add_argument("--apk", type=Path, required=True)
+    parser.add_argument("--jar", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--repository", required=True, help="OWNER/REPOSITORY")
     parser.add_argument("--release-tag", required=True)
@@ -46,6 +47,7 @@ def main() -> None:
         resources=index_pb2.Resources(
             apkUrl=apk_url,
             iconUrl=icon_url,
+            jarUrl=f"{release_base}/{args.jar.name}",
         ),
         extensionLib=info["extensionLib"],
         versionCode=int(info["versionCode"]),
