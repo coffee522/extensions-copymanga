@@ -1,11 +1,85 @@
 package eu.kanade.tachiyomi.extension.zh.copymanga
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 internal data class CopyMangaHtmlPage(
     val total: Int,
     val comics: List<CopyMangaComic>,
 )
+
+internal data class CopyMangaRecommendationsPage(
+    val comics: List<CopyMangaComic>,
+    val hasNextPage: Boolean,
+)
+
+internal fun Document.parseCopyMangaRecommendations(nextOffset: Int): CopyMangaRecommendationsPage {
+    val list = selectFirst("#comic") ?: error("CopyManga HTML response is missing the recommendations")
+    val comics = list.select(".exemptComic_Item").mapNotNull { card ->
+        card.parseCopyMangaCard(".exemptComicItem-txt", ".exemptComic_Item-img")
+    }
+    val next = selectFirst("li.next a[href]")?.absUrl("href")?.toHttpUrlOrNull()
+    return CopyMangaRecommendationsPage(
+        comics = comics,
+        hasNextPage = comics.isNotEmpty() && next?.queryParameter("offset")?.toIntOrNull() == nextOffset,
+    )
+}
+
+internal fun Document.parseCopyMangaRankings(): List<CopyMangaComic> {
+    val list = selectFirst(".ranking-all") ?: error("CopyManga HTML response is missing the rankings")
+    return list.select(".ranking-all-box").mapNotNull { card ->
+        card.parseCopyMangaCard(".ranking-all-topThree-txt", ".ranking-all-topThree-img")
+    }
+}
+
+internal fun Document.parseCopyMangaDetails(comicPath: String): CopyMangaComic {
+    val details = selectFirst(".comicParticulars-title")
+        ?: error("CopyManga HTML response is missing manga details")
+    val name = details.selectFirst("h6")?.text()?.takeIf { it.isNotBlank() }
+        ?: error("CopyManga HTML response is missing the manga title")
+    val statusText = details.select(".comicParticulars-title-right li")
+        .firstOrNull { it.selectFirst("span")?.text() in setOf("狀態：", "状态：") }
+        ?.selectFirst(".comicParticulars-right-txt")
+        ?.text()
+    val status = when (statusText) {
+        "連載中", "连载中" -> CopyMangaValue(0, statusText)
+        "已完結", "已完结", "完結", "完结" -> CopyMangaValue(1, statusText)
+        "短篇" -> CopyMangaValue(2, statusText)
+        else -> null
+    }
+    val authors = details.select("a[href^=/author/]").mapNotNull { author ->
+        author.absUrl("href").toHttpUrlOrNull()?.pathSegments?.getOrNull(1)
+            ?.let { CopyMangaTag(name = author.text(), pathWord = it) }
+    }
+    val themes = details.select(".comicParticulars-tag a[href]").mapNotNull { theme ->
+        val path = theme.absUrl("href").toHttpUrlOrNull()?.queryParameter("theme") ?: return@mapNotNull null
+        CopyMangaTag(name = theme.text().removePrefix("#"), pathWord = path)
+    }
+    return CopyMangaComic(
+        name = name,
+        pathWord = comicPath,
+        author = authors,
+        cover = details.selectFirst(".comicParticulars-left-img img[data-src]")?.absUrl("data-src").orEmpty(),
+        status = status,
+        theme = themes,
+        brief = selectFirst(".comicParticulars-synopsis .intro")?.wholeText()?.trim(),
+    )
+}
+
+private fun Element.parseCopyMangaCard(textSelector: String, imageSelector: String): CopyMangaComic? {
+    val text = selectFirst(textSelector) ?: return null
+    val title = text.selectFirst("a[href^=/comic/]") ?: return null
+    val pathWord = title.absUrl("href").toHttpUrlOrNull()?.pathSegments?.getOrNull(1)
+        ?.takeIf { it.isNotBlank() } ?: return null
+    val name = title.text().takeIf { it.isNotBlank() } ?: return null
+    val cover = selectFirst("$imageSelector img[data-src]")?.absUrl("data-src").orEmpty()
+    val authors = text.select("a[href^=/author/]").mapNotNull { author ->
+        author.absUrl("href").toHttpUrlOrNull()?.pathSegments?.getOrNull(1)
+            ?.let { CopyMangaTag(name = author.text(), pathWord = it) }
+    }
+    return CopyMangaComic(name = name, pathWord = pathWord, author = authors, cover = cover)
+}
 
 /**
  * Parses the server-rendered list used by the public /comics page.

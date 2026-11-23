@@ -1,0 +1,171 @@
+name: Build and publish CopyManga
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copymanga-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'coffee522/extensions-copymanga' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      SIGNING_FINGERPRINT: ff721d2f1961d710e64ee4a388a8055b25fe28a3929c2888e74afad384fd7d43
+      SOURCE_INFO: src/zh/copymanga/build/keiyoushi-source-info.json
+      RELEASE_OUTPUT: src/zh/copymanga/build/outputs/apk/release
+
+    steps:
+      - name: Check out public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: 'platforms;android-37.0 build-tools;37.0.0'
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+
+      - name: Lint and build release APK from source
+        id: build
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-configuration-cache :src:zh:copymanga:lintRelease :src:zh:copymanga:assembleRelease
+          python -m pip install 'protobuf==7.35.1'
+          python - <<'PY'
+          import gzip
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, ".github/scripts")
+          import index_pb2
+
+          output = Path(os.environ["RELEASE_OUTPUT"])
+          info = json.loads(Path(os.environ["SOURCE_INFO"]).read_text())
+          metadata = json.loads((output / "output-metadata.json").read_text())
+          (apk,) = metadata["elements"]
+          version = info["versionName"]
+          if not re.fullmatch(r"1\.6\.[0-9]+", version):
+              raise SystemExit("Invalid release version")
+          if (apk["versionName"], apk["versionCode"]) != (version, int(info["versionCode"])):
+              raise SystemExit("Gradle APK metadata does not match the source")
+          if apk["outputFile"] != f"tachiyomi-zh.copymanga-v{version}.apk":
+              raise SystemExit("Unexpected release APK filename")
+          previous = Path("index.pb")
+          if previous.is_file():
+              index = index_pb2.Index.FromString(gzip.decompress(previous.read_bytes()))
+              (current,) = index.extensionList.extensions
+              if int(info["versionCode"]) <= current.versionCode:
+                  raise SystemExit("Bump the extension version before publishing")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as env:
+              print(f"tag=v{version}", file=env)
+              print(f"apk_name={apk['outputFile']}", file=env)
+          PY
+
+      - name: Sign APK and verify certificate continuity
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          APK_NAME: ${{ steps.build.outputs.apk_name }}
+        run: |
+          test -n "$SIGNING_KEY"
+          test -n "$SIGNING_PASSWORD"
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$key"
+          mkdir -p release-assets
+          signer="$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          "$signer" sign --ks "$key" --ks-key-alias copymanga-release \
+            --ks-pass env:SIGNING_PASSWORD --key-pass env:SIGNING_PASSWORD \
+            --in "$RELEASE_OUTPUT/$APK_NAME" --out "release-assets/$APK_NAME"
+          fingerprint=$("$signer" verify --print-certs "release-assets/$APK_NAME" |
+            awk '/certificate SHA-256 digest:/{print tolower($NF)}')
+          test "$fingerprint" = "$SIGNING_FINGERPRINT"
+
+      - name: Attest the signed APK
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release-assets/${{ steps.build.outputs.apk_name }}
+
+      - name: Publish the attested APK and update Mihon
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.build.outputs.tag }}
+          APK_NAME: ${{ steps.build.outputs.apk_name }}
+        run: |
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          apk="release-assets/$APK_NAME"
+          python scripts/build-repo-index.py --source-info "$SOURCE_INFO" --apk "$apk" \
+            --output-dir . --repository "$GH_REPO" --release-tag "$TAG" --signing-key "$SIGNING_FINGERPRINT"
+          python scripts/verify-repo-index.py --index-dir . --source-info "$SOURCE_INFO" --apk "$apk" \
+            --repository "$GH_REPO" --release-tag "$TAG" --signing-key "$SIGNING_FINGERPRINT"
+
+          if release=$(gh release view "$TAG" --json isDraft,targetCommitish,assets,url); then
+            test "$(jq -r .targetCommitish <<< "$release")" = "$GITHUB_SHA"
+            draft=$(jq -r .isDraft <<< "$release")
+            if ! jq -e --arg name "$APK_NAME" 'any(.assets[]; .name == $name)' <<< "$release" >/dev/null; then
+              test "$draft" = true
+              gh release upload "$TAG" "$apk"
+            fi
+          else
+            notes="$RUNNER_TEMP/release-notes.md"
+            {
+              printf '由公開原始碼透過 [GitHub Actions](%s/%s/actions/runs/%s) 建構、簽署並發布。\n\n' \
+                "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+              printf '可使用 GitHub CLI 驗證 APK 的建構來源。\n\n'
+              printf '\x60\x60\x60sh\ngh attestation verify %s -R %s\n\x60\x60\x60\n' "$APK_NAME" "$GH_REPO"
+            } > "$notes"
+            gh release create "$TAG" "$apk" --target "$GITHUB_SHA" --draft \
+              --title "CopyManga $TAG" --notes-file "$notes"
+            draft=true
+          fi
+
+          published=$(mktemp -d)
+          trap 'rm -rf "$published"' EXIT
+          gh release download "$TAG" --pattern "$APK_NAME" --dir "$published"
+          gh attestation verify "$published/$APK_NAME" -R "$GH_REPO" \
+            --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
+            --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA"
+          if [[ "$draft" == true ]]; then
+            gh release edit "$TAG" --draft=false
+          fi
+          test "$(git ls-remote origin "refs/tags/$TAG" | cut -f1)" = "$GITHUB_SHA"
+
+          git add -- repo.json index.pb
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Update Mihon index for $TAG"
+            git -c credential.helper='!gh auth git-credential' push origin HEAD:refs/heads/main
+          fi
+          gh release view "$TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

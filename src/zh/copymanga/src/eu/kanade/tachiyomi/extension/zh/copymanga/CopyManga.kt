@@ -15,6 +15,7 @@ import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.JsonElement
 import okhttp3.CacheControl
 import okhttp3.ConnectionPool
@@ -24,6 +25,8 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Response
+import org.jsoup.nodes.Document
 import java.util.concurrent.TimeUnit
 
 internal fun copyMangaHasNextPage(
@@ -39,6 +42,21 @@ internal fun Headers.copyMangaHtmlHeaders(): Headers = newBuilder()
     .removeAll("platform")
     .set("Accept", "text/html")
     .build()
+
+internal class CopyMangaHttpException(val code: Int, host: String, message: String? = null) : IllegalStateException("CopyManga API HTTP $code ($host)${message?.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()}")
+
+internal fun Response.copyMangaApiPayload(): CopyMangaApiResponse {
+    if (code == 210) {
+        val message = try {
+            parseAs<CopyMangaApiResponse>().message
+        } catch (_: SerializationException) {
+            null
+        }
+        throw CopyMangaHttpException(code, request.url.host, message)
+    }
+    if (code != 200) throw CopyMangaHttpException(code, request.url.host)
+    return parseAs()
+}
 
 @Source
 abstract class CopyManga :
@@ -160,43 +178,61 @@ abstract class CopyManga :
     }.getOrDefault(emptyList())
 
     private suspend fun mangaPage(request: CopyMangaRequest): MangasPage {
-        val path = request.path
-        val parameters = request.parameters
-        val requestedPageSize = parameters["limit"]?.toIntOrNull()?.takeIf { it > 0 } ?: PAGE_SIZE
-        val results = when {
-            request.transport == CopyMangaRequestTransport.HTML -> htmlMangaPage(parameters)
-            path == "recs" || path == "ranks" -> apiResults<CopyMangaList<CopyMangaRecommendation>>(path, parameters).let { page ->
-                MangaPageResult(
-                    mangas = page.list.map { it.comic.toSManga(transformText = ::displayText) },
-                    offset = page.offset,
-                    total = page.total,
+        if (request.transport == CopyMangaRequestTransport.HTML) return htmlMangaPage(request.parameters)
+        val domain = selectedDomain
+        return try {
+            apiMangaPage(request, "${domain.apiBaseUrl}/api/v3")
+        } catch (error: CopyMangaHttpException) {
+            if (error.code != 521) throw error
+            when (request.path) {
+                "recs" -> htmlRecommendationPage(domain, request.parameters)
+                "comics" -> htmlMangaPage(request.parameters, domain)
+                "ranks" -> htmlRankingPage(domain, request.parameters)
+                "search/comic" -> apiMangaPage(
+                    request = request.copy(
+                        path = "searchcl/comics",
+                        parameters = request.parameters - "_update" + ("platform" to "1"),
+                    ),
+                    baseUrl = "${domain.webBaseUrl}/api/kb/web",
                 )
-            }
-            else -> apiResults<CopyMangaList<CopyMangaComic>>(path, parameters).let { page ->
-                MangaPageResult(
-                    mangas = page.list.map { it.toSManga(transformText = ::displayText) },
-                    offset = page.offset,
-                    total = page.total,
-                )
+                else -> throw error
             }
         }
-
-        return MangasPage(
-            mangas = results.mangas,
-            hasNextPage = copyMangaHasNextPage(
-                offset = results.offset,
-                total = results.total,
-                returnedSize = results.mangas.size,
-                requestedPageSize = requestedPageSize,
-            ),
-        )
     }
 
-    private suspend fun htmlMangaPage(parameters: Map<String, String>): MangaPageResult {
-        val urlBuilder = "${selectedDomain.webBaseUrl}/comics".toHttpUrl().newBuilder()
+    private suspend fun apiMangaPage(request: CopyMangaRequest, baseUrl: String): MangasPage {
+        val path = request.path
+        val parameters = request.parameters
+        val page = if (path == "recs" || path == "ranks") {
+            val recommendations = apiResults<CopyMangaList<CopyMangaRecommendation>>(path, parameters, baseUrl)
+            CopyMangaList(recommendations.total, recommendations.offset, recommendations.list.map { it.comic })
+        } else {
+            apiResults<CopyMangaList<CopyMangaComic>>(path, parameters, baseUrl)
+        }
+        return mangaPageFromTotal(page.list, page.offset, page.total, parameters)
+    }
+
+    private fun mangaPageFromTotal(
+        comics: List<CopyMangaComic>,
+        offset: Int,
+        total: Int,
+        parameters: Map<String, String>,
+    ): MangasPage = MangasPage(
+        mangas = comics.map { it.toSManga(transformText = ::displayText) },
+        hasNextPage = copyMangaHasNextPage(
+            offset = offset,
+            total = total,
+            returnedSize = comics.size,
+            requestedPageSize = parameters["limit"]?.toIntOrNull()?.takeIf { it > 0 } ?: PAGE_SIZE,
+        ),
+    )
+
+    private suspend fun htmlMangaPage(parameters: Map<String, String>, domain: CopyMangaDomain = selectedDomain): MangasPage {
+        val urlBuilder = "${domain.webBaseUrl}/comics".toHttpUrl().newBuilder()
         parameters
             .filterKeys { key -> key != "_update" && key != "top" }
             .forEach { (name, value) -> urlBuilder.addQueryParameter(name, value) }
+        if (parameters["top"] == TOP_FINISH) urlBuilder.addQueryParameter("status", "1")
 
         val page = client.get(
             url = urlBuilder.build(),
@@ -204,11 +240,46 @@ abstract class CopyManga :
             cacheControl = CacheControl.FORCE_NETWORK,
         ).asJsoup().parseCopyMangaHtmlPage()
 
-        return MangaPageResult(
-            mangas = page.comics.map { it.toSManga(transformText = ::displayText) },
+        return mangaPageFromTotal(
+            comics = page.comics,
             offset = parameters["offset"]?.toIntOrNull() ?: 0,
             total = page.total,
+            parameters = parameters,
         )
+    }
+
+    private suspend fun htmlRecommendationPage(domain: CopyMangaDomain, parameters: Map<String, String>): MangasPage {
+        val offset = parameters.getValue("offset")
+        val limit = parameters.getValue("limit")
+        val url = "${domain.webBaseUrl}/recommend".toHttpUrl().newBuilder()
+            .addQueryParameter("type", parameters.getValue("pos"))
+            .addQueryParameter("offset", offset)
+            .addQueryParameter("limit", limit)
+            .build()
+        val page = client.get(
+            url = url,
+            headers = headers.copyMangaHtmlHeaders(),
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).asJsoup().parseCopyMangaRecommendations(offset.toInt() + limit.toInt())
+        return MangasPage(
+            mangas = page.comics.map { it.toSManga(transformText = ::displayText) },
+            hasNextPage = page.hasNextPage,
+        )
+    }
+
+    private suspend fun htmlRankingPage(domain: CopyMangaDomain, parameters: Map<String, String>): MangasPage {
+        val url = "${domain.webBaseUrl}/rank".toHttpUrl().newBuilder()
+            .addQueryParameter("type", parameters.getValue("audience_type"))
+            .addQueryParameter("table", parameters.getValue("date_type"))
+            .build()
+        val rankings = client.get(
+            url = url,
+            headers = headers.copyMangaHtmlHeaders(),
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).asJsoup().parseCopyMangaRankings()
+        val offset = parameters.getValue("offset").toInt()
+        val limit = parameters.getValue("limit").toInt()
+        return mangaPageFromTotal(rankings.drop(offset).take(limit), offset, rankings.size, parameters)
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
@@ -220,8 +291,13 @@ abstract class CopyManga :
         val comicPath = segments.getOrNull(comicIndex + 1)?.takeIf { it.isNotBlank() }
             ?: return null
 
-        val results = apiResults<CopyMangaDetails>("comic2/$comicPath")
-        return results.comic.toSManga(mangaUrl(comicPath), ::displayText)
+        val comic = try {
+            apiResults<CopyMangaDetails>("comic2/$comicPath").comic
+        } catch (error: CopyMangaHttpException) {
+            if (error.code != 521) throw error
+            webMangaDetails(comicPath).parseCopyMangaDetails(comicPath)
+        }
+        return comic.toSManga(mangaUrl(comicPath), ::displayText)
     }
 
     override fun getMangaUrl(manga: SManga): String = "${selectedDomain.webBaseUrl}${mangaUrl(comicPath(manga.url))}"
@@ -239,6 +315,21 @@ abstract class CopyManga :
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val comicPathValue = comicPath(manga.url)
+        return try {
+            fetchApiMangaUpdate(manga, comicPathValue, chapters, fetchDetails, fetchChapters)
+        } catch (error: CopyMangaHttpException) {
+            if (error.code != 521) throw error
+            fetchWebMangaUpdate(manga, comicPathValue, chapters, fetchDetails, fetchChapters)
+        }
+    }
+
+    private suspend fun fetchApiMangaUpdate(
+        manga: SManga,
+        comicPathValue: String,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
         val results = apiResults<CopyMangaDetails>("comic2/$comicPathValue")
 
         val updatedManga = if (fetchDetails) {
@@ -270,6 +361,49 @@ abstract class CopyManga :
             chapters
         }
 
+        return SMangaUpdate(updatedManga, updatedChapters)
+    }
+
+    private suspend fun webMangaDetails(comicPath: String): Document {
+        val url = CHAPTER_WEB_BASE_URL.toHttpUrl().newBuilder()
+            .addPathSegment("comic")
+            .addPathSegment(comicPath)
+            .build()
+        return client.get(
+            url = url,
+            headers = headers.copyMangaHtmlHeaders(),
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).asJsoup()
+    }
+
+    private suspend fun fetchWebMangaUpdate(
+        manga: SManga,
+        comicPath: String,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = webMangaDetails(comicPath)
+        val updatedManga = if (fetchDetails) {
+            document.parseCopyMangaDetails(comicPath).toSManga(mangaUrl(comicPath), ::displayText)
+        } else {
+            manga
+        }
+        val updatedChapters = if (fetchChapters) {
+            val format = document.copyMangaWebChapterFormat()
+            val payload = apiResults<String>(
+                path = "chapters",
+                baseUrl = CHAPTER_WEB_BASE_URL.toHttpUrl().newBuilder()
+                    .addPathSegment("comicdetail")
+                    .addPathSegment(comicPath)
+                    .build()
+                    .toString(),
+                requestHeaders = headers.newBuilder().set("dnts", format.header).build(),
+            )
+            format.decodeChapterCatalog(payload, comicPath).toSChapters(comicPath, chapters, ::displayText)
+        } else {
+            chapters
+        }
         return SMangaUpdate(updatedManga, updatedChapters)
     }
 
@@ -307,13 +441,33 @@ abstract class CopyManga :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val (comicPath, chapterId) = chapterCoordinates(chapter.url)
-        val results = apiResults<CopyMangaPageListWrapper>(
-            path = "comic/$comicPath/chapter2/$chapterId",
-            parameters = mapOf("platform" to "1"),
-        )
+        val results = try {
+            apiResults<CopyMangaPageListWrapper>(
+                path = "comic/$comicPath/chapter2/$chapterId",
+                parameters = mapOf("platform" to "1"),
+            )
+        } catch (error: CopyMangaHttpException) {
+            if (error.code != 521) throw error
+            return webPageList(comicPath, chapterId)
+        }
         return results.chapter.words.zip(results.chapter.contents)
             .sortedBy { (word, _) -> word }
             .mapIndexedNotNull { index, (_, content) -> content.toPage(index, IMAGE_RESOLUTION_REGEX) }
+    }
+
+    private suspend fun webPageList(comicPath: String, chapterId: String): List<Page> {
+        val url = CHAPTER_WEB_BASE_URL.toHttpUrl().newBuilder()
+            .addPathSegment("comic")
+            .addPathSegment(comicPath)
+            .addPathSegment("chapter")
+            .addPathSegment(chapterId)
+            .build()
+        val document = client.get(
+            url = url,
+            headers = headers.copyMangaHtmlHeaders(),
+            cacheControl = CacheControl.FORCE_NETWORK,
+        ).asJsoup()
+        return document.parseCopyMangaWebImageUrls().mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
     private fun comicPath(url: String): String {
@@ -349,24 +503,19 @@ abstract class CopyManga :
     private suspend inline fun <reified T> apiResults(
         path: String,
         parameters: Map<String, String> = emptyMap(),
+        baseUrl: String = "${selectedDomain.apiBaseUrl}/api/v3",
+        requestHeaders: Headers = headers,
     ): T {
-        val urlBuilder = "${selectedDomain.apiBaseUrl}/api/v3/${path.trimStart('/')}".toHttpUrl().newBuilder()
+        val urlBuilder = "$baseUrl/${path.trimStart('/')}".toHttpUrl().newBuilder()
         parameters.forEach { (name, value) -> urlBuilder.addQueryParameter(name, value) }
 
         return apiClient.get(
             url = urlBuilder.build(),
-            headers = headers,
+            headers = requestHeaders,
             cacheControl = apiCacheControl,
             ensureSuccess = false,
         ).use { response ->
-            val payload = response.parseAs<CopyMangaApiResponse>()
-            if (response.code == 210) {
-                val message = payload.message.orEmpty()
-                error("CopyManga API HTTP 210${message.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}")
-            }
-            if (response.code != 200) {
-                error("CopyManga API HTTP ${response.code}")
-            }
+            val payload = response.copyMangaApiPayload()
             if (payload.code != 200) {
                 val message = payload.message.orEmpty()
                 error("CopyManga API code ${payload.code}${message.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}")
@@ -376,15 +525,10 @@ abstract class CopyManga :
         }
     }
 
-    private class MangaPageResult(
-        val mangas: List<SManga>,
-        val offset: Int,
-        val total: Int,
-    )
-
     private fun pageOffset(page: Int): Int = page.minus(1).coerceAtLeast(0) * PAGE_SIZE
 
     companion object {
+        private const val CHAPTER_WEB_BASE_URL = "https://www.copy20.com"
         private val SITE_HOSTS = CopyMangaDomain.entries
             .flatMap { domain ->
                 val host = domain.webBaseUrl.toHttpUrl().host
@@ -394,7 +538,6 @@ abstract class CopyManga :
         private const val PAGE_SIZE = 21
         private const val THEME_PAGE_SIZE = 500
         private const val CHAPTER_PAGE_SIZE = 500
-        private const val DEFAULT_CHAPTER_GROUP = "default"
         private const val RECOMMENDATION_POSITION = 3200102
         private val IMAGE_RESOLUTION_REGEX = Regex(
             "\\d+(?=x\\.(?:jpe?g|png|webp)(?:\\?|$))",
